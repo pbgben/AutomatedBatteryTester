@@ -26,6 +26,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from PIL import Image, ImageDraw
 
 
 # -------------------- Port helpers --------------------
@@ -500,7 +501,7 @@ class App(tk.Tk):
         self.px_conn_var = tk.StringVar(value="PX100: Disconnected")
 
         # test settings
-        self.px_set_current = tk.StringVar(value="1.00")
+        self.px_set_current = tk.StringVar(value="5.00")
         self.px_set_cutoff = tk.StringVar(value="3.00")
 
         # status readouts
@@ -709,7 +710,85 @@ class App(tk.Tk):
         cbutton(px_row, "Connect", self._px_connect).pack(side="left", padx=2)
         cbutton(px_row, "Disc", self._px_disconnect).pack(side="left", padx=2)
         ttk.Label(px_row, textvariable=self.px_conn_var, style="Conn.TLabel").pack(side="right")
+    def _make_dummy_graph_png(self, out_path: str):
+        """
+        Create a dummy completed-test graph that matches your final receipt style:
+        - builds an 800x600 image
+        - removes labels/title (same as your save routine)
+        - thumbnails to receipt width (self.receipt_dots)
+        """
+        # Build dummy dataset (~45 minutes of discharge sampled every 5s)
+        total_s = 45 * 60
+        step_s = 5
+        n = total_s // step_s + 1
 
+        cutoff_v = safe_float(self.px_set_cutoff.get()) or 3.00
+        start_v = 4.15
+        end_v = cutoff_v
+
+        # Make a plausible discharge curve: quick sag, long plateau, then knee to cutoff
+        xs = []
+        vs = []
+        ms = []
+
+        cap_final_mah = 3100.0  # dummy final capacity for test print
+        for i in range(int(n)):
+            t = i * step_s
+            x = t
+            frac = t / total_s
+
+            # Voltage curve shaping (hand-tuned)
+            if frac < 0.08:
+                # initial sag
+                v = start_v - 0.25 * (frac / 0.08)
+            elif frac < 0.85:
+                # plateau slow decline
+                v = (start_v - 0.25) - 0.35 * ((frac - 0.08) / (0.77))
+            else:
+                # knee to cutoff
+                v = (start_v - 0.25 - 0.35) - 0.55 * ((frac - 0.85) / 0.15)
+
+            v = max(end_v, min(start_v, v))
+
+            # Capacity roughly linear with time for CC discharge
+            mah = cap_final_mah * frac
+
+            xs.append(x)
+            vs.append(v)
+            ms.append(mah)
+
+        # Build 800x600 figure (same as your receipt graph)
+        width_px, height_px = 800, 600
+        dpi = 200
+        fig = Figure(dpi=dpi, figsize=(width_px / dpi, height_px / dpi))
+        ax_v = fig.add_subplot(111)
+        ax_mah = ax_v.twinx()
+
+        ax_v.plot(xs, vs)
+        ax_mah.plot(xs, ms)
+
+        # Match your "final receipt style": remove labels/title/legend
+        ax_v.set_xlabel("")
+        ax_v.set_ylabel("")
+        ax_mah.set_ylabel("")
+        ax_v.set_title("")
+        ax_v.tick_params(labelsize=8)
+        ax_mah.tick_params(labelsize=8)
+        ax_v.grid(True, linewidth=0.5)
+        fig.tight_layout()
+
+        # Save big
+        fig.savefig(out_path)
+
+        # Thumbnail to receipt width
+        with Image.open(out_path) as im:
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            target_w = int(getattr(self, "receipt_dots", 384))
+            im.thumbnail((target_w, 10_000), Image.LANCZOS)
+            im.save(out_path)
+
+        return cap_final_mah
 
     def _print_receipt_with_graph(self, graph_png_path: str, capacity_mah):
         """
@@ -749,33 +828,23 @@ class App(tk.Tk):
 
     def _printer_test(self):
         """
-        Print a quick test receipt to the configured network printer.
-        Prints text + a small generated test image so we verify image printing too.
+        Prints a test receipt that looks like a completed run:
+        - header + timestamp
+        - dummy capacity value
+        - dummy graph image (same size/style as real)
         """
-        try:
-            from PIL import Image, ImageDraw, ImageFont
-        except Exception as e:
-            messagebox.showerror("Printer test", f"Pillow not available:\n{e}")
-            return
-
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Make a tiny test image (works on most ESC/POS printers)
-        img_w, img_h = int(self.receipt_dots), 140
-        img = Image.new("RGB", (img_w, img_h), "white")
-        d = ImageDraw.Draw(img)
+        # Create a dummy graph image in the same folder you already use
+        folder = os.path.join(os.getcwd(), "capacity_graphs")
+        os.makedirs(folder, exist_ok=True)
+        tmp_path = os.path.join(folder, "printer_test_dummy_graph.png")
 
-        d.rectangle([0, 0, img_w - 1, img_h - 1], outline="black", width=2)
-        d.text((10, 10), "PRINTER TEST", fill="black")
-        d.text((10, 40), ts, fill="black")
-        d.text((10, 70), f"IP: {self.receipt_printer_ip}", fill="black")
-
-        # Save to a temp file (python-escpos image() accepts a file path reliably)
-        tmp_path = os.path.join(os.getcwd(), "printer_test.png")
         try:
-            img.save(tmp_path)
+            cap_final_mah = self._make_dummy_graph_png(tmp_path)
         except Exception as e:
-            messagebox.showerror("Printer test", f"Failed to save temp test image:\n{e}")
+            messagebox.showerror("Printer test", f"Failed to generate dummy graph:\n{e}")
+            self._log(f"ERROR: dummy graph generation failed: {e}")
             return
 
         try:
@@ -783,8 +852,10 @@ class App(tk.Tk):
 
             p.set(align="center", bold=True, width=2, height=2)
             p.text("TEST RECEIPT\n")
+
             p.set(align="center", bold=False, width=1, height=1)
             p.text(f"{ts}\n")
+            p.text(f"Capacity: {cap_final_mah:.0f} mAh\n")
             p.text("\n")
 
             p.set(align="center")
@@ -793,7 +864,7 @@ class App(tk.Tk):
             p.text("\n")
             p.cut()
 
-            self._log(f"Printer test sent to {self.receipt_printer_ip}:{self.receipt_printer_port}")
+            self._log(f"Printer test sent (dummy graph) -> {self.receipt_printer_ip}:{self.receipt_printer_port}")
 
         except Exception as e:
             messagebox.showerror(
@@ -802,10 +873,11 @@ class App(tk.Tk):
             )
             self._log(f"ERROR: printer test failed: {e}")
         finally:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+            # Keep the image (useful for debugging); if you want it deleted, uncomment:
+            # try: os.remove(tmp_path)
+            # except Exception: pass
+            pass
+
 
 
     # ---------------- common helpers ----------------
@@ -1185,42 +1257,84 @@ class App(tk.Tk):
     def _save_graph_png_auto(self, folder: str, capacity_mah):
         """
         Save graph automatically with timestamp + capacity in filename.
-        Returns saved path or None.
+
+        Generates an 800x600 PNG first (readable), then shrinks with PIL.thumbnail()
+        to receipt width (self.receipt_dots) so it prints nicely.
         """
         os.makedirs(folder, exist_ok=True)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         cap_str = "unknown"
         if capacity_mah is not None:
-            cap_str = f"{capacity_mah:.0f}mAh"
+            try:
+                cap_str = f"{float(capacity_mah):.0f}mAh"
+            except Exception:
+                cap_str = "unknown"
+
         filename = f"capacity_{cap_str}_{ts}.png"
         path = os.path.join(folder, filename)
 
-        # Build a fresh figure for saving (works even if graph window isn't open)
-        dpi = 200
-        width_in = self.receipt_dots / dpi     # e.g. 384px / 200dpi = 1.92"
-        height_in = 4.2                        # tune this if you want shorter/longer receipts
-        fig = Figure(dpi=dpi, figsize=(width_in, height_in))
-
+        # ---- 1) Build a readable 800x600 figure ----
+        width_px, height_px = 800, 600
+        dpi = 200  # 800x600 at 100 DPI
+        fig = Figure(dpi=dpi, figsize=(width_px / dpi, height_px / dpi))
         ax_v = fig.add_subplot(111)
         ax_mah = ax_v.twinx()
 
-        x_v = [s["t"] for s in self._test_samples if s.get("v") is not None and s.get("t") is not None]
-        y_v = [s["v"] for s in self._test_samples if s.get("v") is not None and s.get("t") is not None]
+        # Pull series
+        x_v = [s["t"] for s in self._test_samples if s.get("t") is not None and s.get("v") is not None]
+        y_v = [s["v"] for s in self._test_samples if s.get("t") is not None and s.get("v") is not None]
+
+        x_m = [s["t"] for s in self._test_samples if s.get("t") is not None and s.get("mah") is not None]
+        y_m = [s["mah"] for s in self._test_samples if s.get("t") is not None and s.get("mah") is not None]
+
         if x_v:
             ax_v.plot(x_v, y_v)
-        ax_v.set_xlabel("Time (s)")
-        ax_v.set_ylabel("Voltage (V)")
-
-        x_m = [s["t"] for s in self._test_samples if s.get("mah") is not None and s.get("t") is not None]
-        y_m = [s["mah"] for s in self._test_samples if s.get("mah") is not None and s.get("t") is not None]
         if x_m:
             ax_mah.plot(x_m, y_m)
-        ax_mah.set_ylabel("Capacity (mAh)")
+
+        # ---- 2) Remove labels/legend clutter (as requested) ----
+        # (No legend is created anyway unless you add labels to plot(); but remove axis labels and title)
+        ax_v.set_xlabel("")
+        ax_v.set_ylabel("")
+        ax_mah.set_ylabel("")
+        ax_v.set_title("")
+
+        # Optional: keep ticks but make them subtle
+        ax_v.tick_params(labelsize=8)
+        ax_mah.tick_params(labelsize=8)
+
+        # Optional: light grid helps a lot even without labels
+        ax_v.grid(True, linewidth=0.5)
 
         fig.tight_layout()
+
+        # Save initial PNG
         fig.savefig(path)
+
+        # ---- 3) Shrink with PIL.thumbnail() to receipt width ----
+        try:
+            with Image.open(path) as im:
+                # Ensure RGB (some backends save RGBA)
+                if im.mode not in ("RGB", "L"):
+                    im = im.convert("RGB")
+
+                # shrink to receipt width, keeping aspect
+                target_w = int(getattr(self, "receipt_dots", 384))
+                im.thumbnail((target_w, 10_000), Image.LANCZOS)
+
+                # Optional: convert to 1-bit for crisper receipt printing
+                # If your printer struggles with greyscale, uncomment these 2 lines:
+                # im = im.convert("L")
+                # im = im.point(lambda p: 255 if p > 180 else 0, mode="1")
+
+                im.save(path)
+        except Exception as e:
+            # If thumbnail fails, we still keep the original 800x600 image saved
+            self._log(f"WARNING: could not thumbnail graph for receipt: {e}")
+
         return path
+
 
     def _px_save_graph_png_dialog(self):
         # Keep a manual option if you want it
