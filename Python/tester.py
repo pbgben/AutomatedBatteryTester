@@ -1,4 +1,30 @@
 #!/usr/bin/env python3
+"""
+Cell Tray + DPS5020 + PX100 automation GUI (single-file)
+
+What it does
+- Tray control (Arduino serial): LOAD (HOME+RECONNECT), NEXT cycle, UNLOAD, STOP
+- PSU control (DPS5020 over Modbus RTU): ON/OFF + current polling
+- PX100 capacity test using your working driver (instruments.*)
+- Automation checkboxes:
+    [x] Charge cell (PSU ON until <=0.10A for 10s, then PSU OFF)
+    [x] Capacity test (PX100 reset + discharge until cutoff V)
+    [x] Auto-run all cells (repeat NEXT until tray empty / can't confirm cell)
+- Safety:
+    - PSU is forced OFF before starting any capacity test (even if charge is unticked)
+    - PSU startup grace avoids false "unexpected OFF" right after turning ON
+- Receipt printing (network ESC/POS):
+    - Prints: timestamp, capacity, test current, cutoff voltage, charge/discharge durations
+    - Prints a voltage curve graph (no capacity ramp line)
+    - Graph: rendered 800x600, then PIL.thumbnail() shrunk to receipt width, then "darkened" & thresholded for bold printing
+    - TEST PRINTER prints a dummy "finished" receipt with a dummy voltage curve
+
+Requirements
+- pip: pyserial pymodbus python-escpos pillow matplotlib
+- apt (Ubuntu): python3-tk python3-pil.imagetk
+- Your repo must provide: instruments.instrument and instruments.px100
+"""
+
 import glob
 import math
 import os
@@ -6,7 +32,6 @@ import queue
 import threading
 import time
 from datetime import datetime
-from escpos.printer import Network
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -16,17 +41,17 @@ import serial.tools.list_ports
 from pymodbus.client import ModbusSerialClient
 
 # ---- PX100 driver (your working codebase) ----
-# Run from your repo root (or ensure these are on PYTHONPATH)
 from instruments.instrument import Instrument
 from instruments.px100 import PX100 as PX100_Driver
 
-# ---- Graphing ----
-# pip install matplotlib
+# ---- Printing ----
+from escpos.printer import Network
+from PIL import Image  # for thumbnailing and image prep
+
+# ---- Plotting (save PNGs only; no GUI graph window) ----
 import matplotlib
-matplotlib.use("TkAgg")
+matplotlib.use("Agg")  # headless render for saving images
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from PIL import Image, ImageDraw
 
 
 # -------------------- Port helpers --------------------
@@ -39,7 +64,7 @@ def list_serial_ports():
     return sorted(ports)
 
 
-def parse_tray_status_line(line: str) -> dict:
+def parse_tray_status_line(line):
     out = {}
     line = line.strip()
     if not line.startswith("STATUS"):
@@ -64,33 +89,33 @@ def safe_float(x):
 
 # -------------------- Tray (Arduino) worker --------------------
 class TraySerialWorker(threading.Thread):
-    def __init__(self, rx_queue: queue.Queue, tx_queue: queue.Queue):
+    def __init__(self, rx_queue, tx_queue):
         super().__init__(daemon=True)
         self.rx_queue = rx_queue
         self.tx_queue = tx_queue
         self.ser = None
-        self._stop_evt = threading.Event()   # don't shadow Thread._stop
+        self._stop_evt = threading.Event()
         self._connected = threading.Event()
         self.status_poll_interval = 0.5
         self._last_poll = 0.0
 
-    def connect(self, port: str, baud: int = 9600):
+    def connect(self, port, baud=9600):
         self.tx_queue.put(("__CONNECT__", {"port": port, "baud": baud}))
 
     def disconnect(self):
         self.tx_queue.put(("__DISCONNECT__", {}))
 
-    def is_connected(self) -> bool:
+    def is_connected(self):
         return self._connected.is_set()
 
-    def send(self, cmd: str):
+    def send(self, cmd):
         self.tx_queue.put(("CMD", {"cmd": cmd}))
 
     def stop(self):
         self._stop_evt.set()
         self.disconnect()
 
-    def _do_connect(self, port: str, baud: int):
+    def _do_connect(self, port, baud):
         try:
             if self.ser:
                 try:
@@ -100,11 +125,11 @@ class TraySerialWorker(threading.Thread):
             self.ser = serial.Serial(port=port, baudrate=baud, timeout=0.1)
             time.sleep(1.2)  # allow Arduino auto-reset
             self._connected.set()
-            self.rx_queue.put(("INFO", f"Tray connected: {port} @ {baud}"))
+            self.rx_queue.put(("INFO", "Tray connected: %s @ %d" % (port, baud)))
         except Exception as e:
             self._connected.clear()
             self.ser = None
-            self.rx_queue.put(("ERR", f"Tray connect failed: {e}"))
+            self.rx_queue.put(("ERR", "Tray connect failed: %s" % e))
 
     def _do_disconnect(self):
         try:
@@ -116,13 +141,13 @@ class TraySerialWorker(threading.Thread):
         self._connected.clear()
         self.rx_queue.put(("INFO", "Tray disconnected"))
 
-    def _write_line(self, s: str):
+    def _write_line(self, s):
         if not self.ser or not self.is_connected():
             return
         try:
             self.ser.write((s.strip() + "\n").encode("utf-8"))
         except Exception as e:
-            self.rx_queue.put(("ERR", f"Tray write failed: {e}"))
+            self.rx_queue.put(("ERR", "Tray write failed: %s" % e))
             self._do_disconnect()
 
     def _read_lines(self):
@@ -137,7 +162,7 @@ class TraySerialWorker(threading.Thread):
                 if line:
                     self.rx_queue.put(("LINE", line))
         except Exception as e:
-            self.rx_queue.put(("ERR", f"Tray read failed: {e}"))
+            self.rx_queue.put(("ERR", "Tray read failed: %s" % e))
             self._do_disconnect()
 
     def run(self):
@@ -174,7 +199,7 @@ class DPS5020:
     REG_IOUT = 0x0003
     REG_OUT_EN = 0x0009
 
-    def __init__(self, port: str, baudrate: int = 9600, slave_id: int = 1):
+    def __init__(self, port, baudrate=9600, slave_id=1):
         self.port = port
         self.baudrate = baudrate
         self.slave_id = slave_id
@@ -182,7 +207,7 @@ class DPS5020:
         self.connected = False
         self.lock = threading.Lock()
 
-    def connect(self) -> bool:
+    def connect(self):
         with self.lock:
             try:
                 self.client = ModbusSerialClient(
@@ -211,7 +236,7 @@ class DPS5020:
             self.client = None
             self.connected = False
 
-    def _read1(self, reg: int):
+    def _read1(self, reg):
         if not self.connected or not self.client:
             return None
         try:
@@ -222,7 +247,7 @@ class DPS5020:
             return None
         return None
 
-    def _write1(self, reg: int, value: int) -> bool:
+    def _write1(self, reg, value):
         if not self.connected or not self.client:
             return False
         try:
@@ -239,14 +264,14 @@ class DPS5020:
         v = self._read1(self.REG_OUT_EN)
         return None if v is None else (1 if v != 0 else 0)
 
-    def set_output_enabled(self, enabled: bool) -> bool:
+    def set_output_enabled(self, enabled):
         return self._write1(self.REG_OUT_EN, 1 if enabled else 0)
 
 
 # -------------------- PX100 driver adapter + controller --------------------
 class SerialRawAdapter:
     """Adapter for PX100 driver transport expectations."""
-    def __init__(self, port: str, baud: int = 9600, timeout: float = 2.0):
+    def __init__(self, port, baud=9600, timeout=2.0):
         self._ser = serial.Serial(
             port=port,
             baudrate=baud,
@@ -256,40 +281,40 @@ class SerialRawAdapter:
             timeout=timeout,
         )
 
-    def write_raw(self, b: bytes) -> int:
+    def write_raw(self, b):
         return self._ser.write(b)
 
-    def read_raw(self, n: int) -> bytes:
+    def read_raw(self, n):
         return self._ser.read(n)
 
-    def write_bytes(self, b: bytes) -> int:
+    def write_bytes(self, b):
         return self.write_raw(b)
 
-    def read_bytes(self, n: int) -> bytes:
+    def read_bytes(self, n):
         return self.read_raw(n)
 
     @property
-    def bytes_in_buffer(self) -> int:
+    def bytes_in_buffer(self):
         try:
             return int(self._ser.in_waiting)
         except Exception:
             return 0
 
-    def flush(self) -> None:
+    def flush(self):
         try:
             self._ser.reset_input_buffer()
             self._ser.reset_output_buffer()
         except Exception:
             pass
 
-    def close(self) -> None:
+    def close(self):
         try:
             self._ser.close()
         except Exception:
             pass
 
 
-def try_command(dev: PX100_Driver, cmd_name: str, value):
+def try_command(dev, cmd_name, value):
     """Call the driver's command method in a couple common forms."""
     try:
         return dev.command(cmd_name, value)
@@ -302,7 +327,7 @@ def try_command(dev: PX100_Driver, cmd_name: str, value):
     raise
 
 
-def normalize_readall(data) -> dict:
+def normalize_readall(data):
     if data is None:
         return {}
     if isinstance(data, dict):
@@ -320,7 +345,7 @@ def normalize_readall(data) -> dict:
 
 class PX100Controller:
     """Thin wrapper used by the GUI."""
-    def __init__(self, port: str, baud: int = 9600, timeout_s: float = 2.0):
+    def __init__(self, port, baud=9600, timeout_s=2.0):
         self.port = port
         self.baud = baud
         self.timeout_s = timeout_s
@@ -328,11 +353,10 @@ class PX100Controller:
         self.dev = None
         self.connected = False
         self.lock = threading.Lock()
-
         self.tol_v = 0.01
         self.tol_a = 0.01
 
-    def connect(self) -> bool:
+    def connect(self):
         with self.lock:
             try:
                 self.transport = SerialRawAdapter(self.port, baud=self.baud, timeout=self.timeout_s)
@@ -366,7 +390,7 @@ class PX100Controller:
             self.dev = None
             self.connected = False
 
-    def read_all(self) -> dict:
+    def read_all(self):
         with self.lock:
             if not self.connected or not self.dev:
                 return {}
@@ -375,10 +399,10 @@ class PX100Controller:
             except Exception:
                 return {}
 
-    def probe(self) -> bool:
+    def probe(self):
         return bool(self.read_all())
 
-    def reset(self) -> bool:
+    def reset(self):
         with self.lock:
             if not self.connected or not self.dev:
                 return False
@@ -389,7 +413,7 @@ class PX100Controller:
             except Exception:
                 return False
 
-    def set_load_enabled(self, enabled: bool) -> bool:
+    def set_load_enabled(self, enabled):
         with self.lock:
             if not self.connected or not self.dev:
                 return False
@@ -399,7 +423,7 @@ class PX100Controller:
             except Exception:
                 return False
 
-    def _set_if_needed(self, cmd_name: str, current_val, desired_val, tol: float) -> bool:
+    def _set_if_needed(self, cmd_name, current_val, desired_val, tol):
         with self.lock:
             if not self.connected or not self.dev:
                 return False
@@ -419,7 +443,7 @@ class PX100Controller:
             except Exception:
                 return False
 
-    def set_current_a(self, current_a: float) -> bool:
+    def set_current_a(self, current_a):
         st = self.read_all()
         return self._set_if_needed(
             Instrument.COMMAND_SET_CURRENT,
@@ -428,7 +452,7 @@ class PX100Controller:
             tol=self.tol_a,
         )
 
-    def set_cutoff_v(self, cutoff_v: float) -> bool:
+    def set_cutoff_v(self, cutoff_v):
         st = self.read_all()
         return self._set_if_needed(
             Instrument.COMMAND_SET_VOLTAGE,
@@ -437,7 +461,7 @@ class PX100Controller:
             tol=self.tol_v,
         )
 
-    def start_capacity_test(self, current_a: float, cutoff_v: float) -> bool:
+    def start_capacity_test(self, current_a, cutoff_v):
         ok = self.set_load_enabled(False)
         time.sleep(0.15)
         ok = ok and self.set_current_a(current_a)
@@ -453,7 +477,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Cell Tray + DPS5020 + PX100")
-        self.geometry("1200x760")
+        self.geometry("1200x780")
 
         # Tray
         self.tray_rx = queue.Queue()
@@ -461,47 +485,47 @@ class App(tk.Tk):
         self.tray = TraySerialWorker(self.tray_rx, self.tray_tx)
         self.tray.start()
 
-        # PSU + Load
+        # PSU + PX100
         self.dps = None
         self.px100 = None
 
-        # PSU startup grace (avoids "unexpected OFF" right after enabling output)
-        self.psu_on_grace_s = 4.0     # time allowed for PSU to report ON
-        self._psu_on_cmd_ts = None    # timestamp when we commanded PSU ON
-
-        # Receipt printer
-        self.receipt_printer_ip = "192.168.14.223"
-        self.receipt_printer_port = 9100  # common raw TCP port for receipt printers :contentReference[oaicite:2]{index=2}
-        self.receipt_dots = 384  # image width in pixels for printing
-
-
-        # ---- last PSU readings (for automation) ----
+        # last PSU readings (for automation)
         self._psu_last_cur_a = None
         self._psu_last_out_en = None
 
-        # ---- Tray status snapshot (for automation) ----
+        # Tray status snapshot (for automation)
         self._tray_status_latest = {}
         self._tray_status_ts = 0.0
         self._tray_empty_hint = False
 
-        # UI vars
+        # Receipt printer
+        self.receipt_printer_ip = "192.168.14.223"
+        self.receipt_printer_port = 9100
+        self.receipt_dots = 384  # good default for 54mm paper class printers
+
+        # Image print "darkness" tuning
+        self.receipt_img_contrast = 2.2
+        self.receipt_img_sharpness = 1.5
+        self.receipt_img_threshold = 180  # lower = darker, higher = lighter (try 160-190)
+
+        # PSU startup grace
+        self.psu_on_grace_s = 4.0
+        self._psu_on_cmd_ts = None
+
+        # UI vars (ports only; baud is always 9600, PSU ID always 1)
         self.tray_port = tk.StringVar(value="")
-        self.tray_baud = tk.StringVar(value="9600")
         self.tray_conn_var = tk.StringVar(value="Tray: Disconnected")
 
         self.psu_port = tk.StringVar(value="")
-        self.psu_baud = tk.StringVar(value="9600")
-        self.psu_slave = tk.StringVar(value="1")
         self.psu_conn_var = tk.StringVar(value="PSU: Disconnected")
         self.psu_current_var = tk.StringVar(value="--.- A")
         self.psu_out_var = tk.StringVar(value="--")
 
         self.px_port = tk.StringVar(value="")
-        self.px_baud = tk.StringVar(value="9600")
         self.px_conn_var = tk.StringVar(value="PX100: Disconnected")
 
         # test settings
-        self.px_set_current = tk.StringVar(value="5.00")
+        self.px_set_current = tk.StringVar(value="1.00")
         self.px_set_cutoff = tk.StringVar(value="3.00")
 
         # status readouts
@@ -520,10 +544,10 @@ class App(tk.Tk):
             "r2": tk.StringVar(value="-"),
         }
 
-        # ---------------- automation checkboxes ----------------
-        self.auto_charge = tk.BooleanVar(value=True)   # charge until cutoff
-        self.auto_test = tk.BooleanVar(value=True)     # capacity test
-        self.auto_run = tk.BooleanVar(value=False)     # keep going cell-to-cell
+        # Automation checkboxes
+        self.auto_charge = tk.BooleanVar(value=True)
+        self.auto_test = tk.BooleanVar(value=True)
+        self.auto_run = tk.BooleanVar(value=False)
 
         # charge cutoff behavior
         self.charge_cutoff_a = 0.10
@@ -534,19 +558,18 @@ class App(tk.Tk):
         self._proc_state = "IDLE"
         self._proc_cancel = False
 
-        # PX100 test logging for graph
+        # per-cell timing
+        self._cell_charge_start_ts = None
+        self._cell_charge_end_ts = None
+        self._cell_discharge_start_ts = None
+        self._cell_discharge_end_ts = None
+
+        # PX100 test logging
         self._test_running = False
         self._test_t0 = None
         self._test_samples = []   # list of {"t":..., "v":..., "mah":...}
         self._test_cutoff_v = None
         self._last_saved_path = None
-
-        # Graph window
-        self._graph_win = None
-        self._graph_canvas = None
-        self._graph_fig = None
-        self._graph_ax_v = None
-        self._graph_ax_mah = None
 
         self._build_ui()
         self._refresh_ports()
@@ -577,10 +600,7 @@ class App(tk.Tk):
         tray_ctrl.pack(fill="x")
 
         ttk.Button(tray_ctrl, text="LOAD", command=self._cmd_load).pack(fill="x", pady=5)
-
-        # NEXT CELL now triggers the automation sequence for the next cell
         ttk.Button(tray_ctrl, text="NEXT CELL (run cycle)", command=self._start_cycle_next_cell).pack(fill="x", pady=5)
-
         ttk.Button(tray_ctrl, text="UNLOAD", command=lambda: self._tray_send("UNLOAD")).pack(fill="x", pady=5)
         ttk.Separator(tray_ctrl).pack(fill="x", pady=10)
         ttk.Button(tray_ctrl, text="STOP (cancel cycle)", command=self._stop_cycle).pack(fill="x", pady=5)
@@ -592,8 +612,8 @@ class App(tk.Tk):
         ttk.Checkbutton(auto_ctrl, text="Charge cell (PSU until 0.10A for 10s)", variable=self.auto_charge).pack(anchor="w")
         ttk.Checkbutton(auto_ctrl, text="Capacity test (PX100)", variable=self.auto_test).pack(anchor="w")
         ttk.Checkbutton(auto_ctrl, text="Auto-run all cells (repeat until tray empty)", variable=self.auto_run).pack(anchor="w", pady=(6, 0))
-        ttk.Button(auto_ctrl, text="TEST PRINTER", command=self._printer_test).pack(fill="x", pady=(8, 0))
 
+        ttk.Button(auto_ctrl, text="TEST PRINTER", command=self._printer_test).pack(fill="x", pady=(10, 0))
 
         # --- PSU controls ---
         psu_ctrl = ttk.LabelFrame(left, text="PSU Controls", padding=10)
@@ -604,8 +624,8 @@ class App(tk.Tk):
         ttk.Button(psu_btns, text="PSU ON", command=self._psu_on).pack(side="left", expand=True, fill="x", padx=(0, 6))
         ttk.Button(psu_btns, text="PSU OFF", command=self._psu_off).pack(side="left", expand=True, fill="x", padx=(0, 6))
 
-        # --- PX100 controls ---
-        px_ctrl = ttk.LabelFrame(left, text="PX100 Capacity Test", padding=10)
+        # --- PX100 controls (manual) ---
+        px_ctrl = ttk.LabelFrame(left, text="PX100 Capacity Test (manual)", padding=10)
         px_ctrl.pack(fill="x", pady=(10, 0))
 
         row = ttk.Frame(px_ctrl)
@@ -622,8 +642,7 @@ class App(tk.Tk):
         px_btns.pack(fill="x", pady=(8, 0))
         ttk.Button(px_btns, text="START TEST", command=self._px_start).pack(side="left", expand=True, fill="x", padx=(0, 6))
         ttk.Button(px_btns, text="RESET", command=self._px_reset).pack(side="left", expand=True, fill="x", padx=(0, 6))
-        ttk.Button(px_btns, text="STOP LOAD", command=self._px_stop).pack(side="left", expand=True, fill="x", padx=(0, 6))
-        ttk.Button(px_btns, text="SHOW GRAPH", command=self._px_show_graph).pack(side="left", expand=True, fill="x")
+        ttk.Button(px_btns, text="STOP LOAD", command=self._px_stop).pack(side="left", expand=True, fill="x")
 
         # --- Status panel ---
         status = ttk.LabelFrame(right, text="Status (auto update)", padding=10)
@@ -663,11 +682,11 @@ class App(tk.Tk):
         logf = ttk.LabelFrame(right, text="Log", padding=10)
         logf.pack(fill="both", expand=True, pady=(10, 0))
 
-        self.log = tk.Text(logf, height=12, wrap="word", font=("Sans", 12))
+        self.log = tk.Text(logf, height=14, wrap="word", font=("Sans", 12))
         self.log.pack(fill="both", expand=True)
         self.log.configure(state="disabled")
 
-        # ---------- Bottom connection bar ----------
+        # ---------- Bottom connection bar (single row, inline) ----------
         conn_bar = ttk.LabelFrame(self, text="Connections", padding=6)
         conn_bar.pack(side="bottom", fill="x")
 
@@ -677,211 +696,38 @@ class App(tk.Tk):
         def cbutton(parent, text, cmd):
             return ttk.Button(parent, text=text, command=cmd, style="Conn.TButton")
 
-        # ---- Tray ----
-        tray_row = ttk.Frame(conn_bar)
-        tray_row.pack(fill="x", pady=2)
-        clabel(tray_row, "Tray").pack(side="left", padx=(0, 6))
-        self.tray_combo = ttk.Combobox(tray_row, textvariable=self.tray_port, width=12, state="readonly")
-        self.tray_combo.pack(side="left")
-        ttk.Entry(tray_row, textvariable=self.tray_baud, width=6).pack(side="left", padx=4)
-        cbutton(tray_row, "Connect", self._tray_connect).pack(side="left", padx=2)
-        cbutton(tray_row, "Disc", self._tray_disconnect).pack(side="left", padx=2)
-        ttk.Label(tray_row, textvariable=self.tray_conn_var, style="Conn.TLabel").pack(side="right")
+        row = ttk.Frame(conn_bar)
+        row.pack(fill="x")
 
-        # ---- PSU ----
-        psu_row = ttk.Frame(conn_bar)
-        psu_row.pack(fill="x", pady=2)
-        clabel(psu_row, "PSU").pack(side="left", padx=(0, 6))
-        self.psu_combo = ttk.Combobox(psu_row, textvariable=self.psu_port, width=12, state="readonly")
-        self.psu_combo.pack(side="left")
-        ttk.Entry(psu_row, textvariable=self.psu_baud, width=6).pack(side="left", padx=4)
-        ttk.Entry(psu_row, textvariable=self.psu_slave, width=4).pack(side="left", padx=4)
-        cbutton(psu_row, "Connect", self._psu_connect).pack(side="left", padx=2)
-        cbutton(psu_row, "Disc", self._psu_disconnect).pack(side="left", padx=2)
-        ttk.Label(psu_row, textvariable=self.psu_conn_var, style="Conn.TLabel").pack(side="right")
+        # TRAY
+        cbutton(row, "Refresh", self._refresh_ports).pack(side="left", padx=(0, 10))
+        clabel(row, "Tray").pack(side="left", padx=(0, 4))
+        self.tray_combo = ttk.Combobox(row, textvariable=self.tray_port, width=10, state="readonly")
+        self.tray_combo.pack(side="left", padx=(0, 4))
+        cbutton(row, "Connect", self._tray_connect).pack(side="left", padx=(0, 2))
+        cbutton(row, "Disc", self._tray_disconnect).pack(side="left", padx=(0, 10))
 
-        # ---- PX100 ----
-        px_row = ttk.Frame(conn_bar)
-        px_row.pack(fill="x", pady=2)
-        clabel(px_row, "PX100").pack(side="left", padx=(0, 6))
-        self.px_combo = ttk.Combobox(px_row, textvariable=self.px_port, width=12, state="readonly")
-        self.px_combo.pack(side="left")
-        ttk.Entry(px_row, textvariable=self.px_baud, width=6).pack(side="left", padx=4)
-        cbutton(px_row, "Connect", self._px_connect).pack(side="left", padx=2)
-        cbutton(px_row, "Disc", self._px_disconnect).pack(side="left", padx=2)
-        ttk.Label(px_row, textvariable=self.px_conn_var, style="Conn.TLabel").pack(side="right")
-    def _make_dummy_graph_png(self, out_path: str):
-        """
-        Create a dummy completed-test graph that matches your final receipt style:
-        - builds an 800x600 image
-        - removes labels/title (same as your save routine)
-        - thumbnails to receipt width (self.receipt_dots)
-        """
-        # Build dummy dataset (~45 minutes of discharge sampled every 5s)
-        total_s = 45 * 60
-        step_s = 5
-        n = total_s // step_s + 1
+        # PSU
+        clabel(row, "PSU").pack(side="left", padx=(0, 4))
+        self.psu_combo = ttk.Combobox(row, textvariable=self.psu_port, width=10, state="readonly")
+        self.psu_combo.pack(side="left", padx=(0, 4))
+        cbutton(row, "Connect", self._psu_connect).pack(side="left", padx=(0, 2))
+        cbutton(row, "Disc", self._psu_disconnect).pack(side="left", padx=(0, 10))
 
-        cutoff_v = safe_float(self.px_set_cutoff.get()) or 3.00
-        start_v = 4.15
-        end_v = cutoff_v
+        # PX100
+        clabel(row, "PX100").pack(side="left", padx=(0, 4))
+        self.px_combo = ttk.Combobox(row, textvariable=self.px_port, width=10, state="readonly")
+        self.px_combo.pack(side="left", padx=(0, 4))
+        cbutton(row, "Connect", self._px_connect).pack(side="left", padx=(0, 2))
+        cbutton(row, "Disc", self._px_disconnect).pack(side="left", padx=(0, 10))
 
-        # Make a plausible discharge curve: quick sag, long plateau, then knee to cutoff
-        xs = []
-        vs = []
-        ms = []
-
-        cap_final_mah = 3100.0  # dummy final capacity for test print
-        for i in range(int(n)):
-            t = i * step_s
-            x = t
-            frac = t / total_s
-
-            # Voltage curve shaping (hand-tuned)
-            if frac < 0.08:
-                # initial sag
-                v = start_v - 0.25 * (frac / 0.08)
-            elif frac < 0.85:
-                # plateau slow decline
-                v = (start_v - 0.25) - 0.35 * ((frac - 0.08) / (0.77))
-            else:
-                # knee to cutoff
-                v = (start_v - 0.25 - 0.35) - 0.55 * ((frac - 0.85) / 0.15)
-
-            v = max(end_v, min(start_v, v))
-
-            # Capacity roughly linear with time for CC discharge
-            mah = cap_final_mah * frac
-
-            xs.append(x)
-            vs.append(v)
-            ms.append(mah)
-
-        # Build 800x600 figure (same as your receipt graph)
-        width_px, height_px = 800, 600
-        dpi = 200
-        fig = Figure(dpi=dpi, figsize=(width_px / dpi, height_px / dpi))
-        ax_v = fig.add_subplot(111)
-        ax_mah = ax_v.twinx()
-
-        ax_v.plot(xs, vs)
-        ax_mah.plot(xs, ms)
-
-        # Match your "final receipt style": remove labels/title/legend
-        ax_v.set_xlabel("")
-        ax_v.set_ylabel("")
-        ax_mah.set_ylabel("")
-        ax_v.set_title("")
-        ax_v.tick_params(labelsize=8)
-        ax_mah.tick_params(labelsize=8)
-        ax_v.grid(True, linewidth=0.5)
-        fig.tight_layout()
-
-        # Save big
-        fig.savefig(out_path)
-
-        # Thumbnail to receipt width
-        with Image.open(out_path) as im:
-            if im.mode not in ("RGB", "L"):
-                im = im.convert("RGB")
-            target_w = int(getattr(self, "receipt_dots", 384))
-            im.thumbnail((target_w, 10_000), Image.LANCZOS)
-            im.save(out_path)
-
-        return cap_final_mah
-
-    def _print_receipt_with_graph(self, graph_png_path: str, capacity_mah):
-        """
-        Print a receipt: title + timestamp + capacity + the graph image, then cut.
-        Assumes an ESC/POS compatible network receipt printer.
-        """
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        try:
-            p = Network(self.receipt_printer_ip, port=self.receipt_printer_port, timeout=10)
-
-            p.set(align="center", bold=True, width=2, height=2)
-            p.text("CELL CAPACITY\n")
-
-            p.set(align="center", bold=False, width=1, height=1)
-            p.text(f"{ts}\n")
-
-            if capacity_mah is None:
-                p.text("Capacity: (unknown)\n")
-            else:
-                p.set(bold=True)
-                p.text(f"Capacity: {float(capacity_mah):.0f} mAh\n")
-                p.set(bold=False)
-
-            p.text("\n")
-
-            # Print the graph image
-            # python-escpos supports images on network printers :contentReference[oaicite:3]{index=3}
-            p.set(align="center")
-            p.image(graph_png_path)
-
-            p.text("\n")
-            p.cut()
-
-        except Exception as e:
-            self._log(f"CYCLE: ERROR printing receipt: {e}")
-
-    def _printer_test(self):
-        """
-        Prints a test receipt that looks like a completed run:
-        - header + timestamp
-        - dummy capacity value
-        - dummy graph image (same size/style as real)
-        """
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        # Create a dummy graph image in the same folder you already use
-        folder = os.path.join(os.getcwd(), "capacity_graphs")
-        os.makedirs(folder, exist_ok=True)
-        tmp_path = os.path.join(folder, "printer_test_dummy_graph.png")
-
-        try:
-            cap_final_mah = self._make_dummy_graph_png(tmp_path)
-        except Exception as e:
-            messagebox.showerror("Printer test", f"Failed to generate dummy graph:\n{e}")
-            self._log(f"ERROR: dummy graph generation failed: {e}")
-            return
-
-        try:
-            p = Network(self.receipt_printer_ip, port=self.receipt_printer_port, timeout=10)
-
-            p.set(align="center", bold=True, width=2, height=2)
-            p.text("TEST RECEIPT\n")
-
-            p.set(align="center", bold=False, width=1, height=1)
-            p.text(f"{ts}\n")
-            p.text(f"Capacity: {cap_final_mah:.0f} mAh\n")
-            p.text("\n")
-
-            p.set(align="center")
-            p.image(tmp_path)
-
-            p.text("\n")
-            p.cut()
-
-            self._log(f"Printer test sent (dummy graph) -> {self.receipt_printer_ip}:{self.receipt_printer_port}")
-
-        except Exception as e:
-            messagebox.showerror(
-                "Printer test",
-                f"Failed to print to {self.receipt_printer_ip}:{self.receipt_printer_port}\n\n{e}",
-            )
-            self._log(f"ERROR: printer test failed: {e}")
-        finally:
-            # Keep the image (useful for debugging); if you want it deleted, uncomment:
-            # try: os.remove(tmp_path)
-            # except Exception: pass
-            pass
-
-
+        # Connection statuses on right
+        ttk.Label(row, textvariable=self.tray_conn_var, style="Conn.TLabel").pack(side="right", padx=(10, 0))
+        ttk.Label(row, textvariable=self.psu_conn_var, style="Conn.TLabel").pack(side="right", padx=(10, 0))
+        ttk.Label(row, textvariable=self.px_conn_var, style="Conn.TLabel").pack(side="right", padx=(10, 0))
 
     # ---------------- common helpers ----------------
-    def _log(self, msg: str):
+    def _log(self, msg):
         self.log.configure(state="normal")
         self.log.insert("end", msg + "\n")
         self.log.see("end")
@@ -900,19 +746,36 @@ class App(tk.Tk):
         if ports and self.px_port.get() not in ports:
             self.px_port.set(ports[0])
 
-    def _tray_status_fresh(self, max_age_s: float = 2.0) -> bool:
+    def _fmt_duration(self, seconds):
+        if seconds is None:
+            return "--:--"
+        try:
+            s = int(round(float(seconds)))
+        except Exception:
+            return "--:--"
+        m = s // 60
+        r = s % 60
+        if m < 100:
+            return "%02d:%02d" % (m, r)
+        h = m // 60
+        m2 = m % 60
+        return "%d:%02d:%02d" % (h, m2, r)
+
+    def _tray_status_fresh(self, max_age_s=2.0):
         return (time.time() - self._tray_status_ts) <= max_age_s
 
-    def _tray_cell_looks_loaded(self) -> bool:
+    def _tray_cell_looks_loaded(self):
         """Best-effort: loaded if any of contacts/aligned/detectClosed == 1 in STATUS."""
         if not self._tray_status_fresh():
             return False
         st = self._tray_status_latest or {}
+
         def as_int(x):
             try:
                 return int(str(x).strip())
             except Exception:
                 return None
+
         contacts = as_int(st.get("contacts"))
         aligned = as_int(st.get("aligned"))
         detect = as_int(st.get("detectClosed"))
@@ -924,17 +787,12 @@ class App(tk.Tk):
         if not port:
             messagebox.showwarning("Tray", "Select a tray serial port.")
             return
-        try:
-            baud = int(self.tray_baud.get().strip())
-        except ValueError:
-            messagebox.showwarning("Tray", "Tray baud must be a number.")
-            return
-        self.tray.connect(port, baud)
+        self.tray.connect(port, 9600)
 
     def _tray_disconnect(self):
         self.tray.disconnect()
 
-    def _tray_send(self, cmd: str):
+    def _tray_send(self, cmd):
         self.tray.send(cmd)
 
     def _cmd_load(self):
@@ -977,17 +835,13 @@ class App(tk.Tk):
         if not port:
             messagebox.showwarning("PSU", "Select a PSU serial port.")
             return
-        try:
-            baud = int(self.psu_baud.get().strip())
-            slave = int(self.psu_slave.get().strip())
-        except ValueError:
-            messagebox.showwarning("PSU", "PSU baud and ID must be numbers.")
-            return
 
+        baud = 9600
+        slave = 1
         self.dps = DPS5020(port, baudrate=baud, slave_id=slave)
         if self.dps.connect():
-            self.psu_conn_var.set(f"PSU: Connected {port} @ {baud}, ID {slave}")
-            self._log(f"PSU connected: {port} (baud {baud}, id {slave})")
+            self.psu_conn_var.set("PSU: Connected %s @ %d, ID %d" % (port, baud, slave))
+            self._log("PSU connected: %s (baud %d, id %d)" % (port, baud, slave))
         else:
             self.psu_conn_var.set("PSU: Connect failed")
             self._log("ERROR: PSU connect failed")
@@ -1006,6 +860,7 @@ class App(tk.Tk):
         if not self.dps or not self.dps.connected:
             self._log("ERROR: PSU not connected")
             return
+        self._psu_on_cmd_ts = time.time()
         ok = self.dps.set_output_enabled(True)
         self._log("PSU ON" if ok else "ERROR: PSU ON failed")
 
@@ -1025,7 +880,7 @@ class App(tk.Tk):
             self._psu_last_cur_a = cur_a
 
             self.psu_out_var.set("--" if out_en is None else ("ON" if out_en else "OFF"))
-            self.psu_current_var.set("--.- A" if cur_a is None else f"{cur_a:.2f} A")
+            self.psu_current_var.set("--.- A" if cur_a is None else "%.2f A" % cur_a)
         else:
             self._psu_last_out_en = None
             self._psu_last_cur_a = None
@@ -1038,15 +893,10 @@ class App(tk.Tk):
         if not port:
             messagebox.showwarning("PX100", "Select a PX100 serial port.")
             return
-        try:
-            baud = int(self.px_baud.get().strip())
-        except ValueError:
-            messagebox.showwarning("PX100", "PX100 baud must be a number.")
-            return
 
-        self.px100 = PX100Controller(port, baud=baud, timeout_s=2.0)
+        self.px100 = PX100Controller(port, baud=9600, timeout_s=2.0)
         if self.px100.connect():
-            self.px_conn_var.set(f"PX100: Connected {port} @ {baud}")
+            self.px_conn_var.set("PX100: Connected %s @ 9600" % port)
             ok = self.px100.probe()
             self._log("PX100 probe OK" if ok else "PX100 connected but not responding (wrong port/wiring)")
         else:
@@ -1082,10 +932,19 @@ class App(tk.Tk):
         self._log("PX100 STOP LOAD" if ok else "ERROR: PX100 stop failed")
 
     def _px_start(self):
-        """Manual start (kept), also used by automation."""
+        """Manual start (also used by automation). Returns True/False."""
         if not self.px100 or not self.px100.connected:
             self._log("ERROR: PX100 not connected")
             return False
+
+        # ALWAYS force PSU OFF before enabling PX100 load
+        try:
+            if self.dps and self.dps.connected:
+                self.dps.set_output_enabled(False)
+                self._log("PX100: ensuring PSU is OFF before test")
+        except Exception as e:
+            self._log("WARNING: could not force PSU OFF: %s" % e)
+
         try:
             current_a = float(self.px_set_current.get().strip())
             cutoff_v = float(self.px_set_cutoff.get().strip())
@@ -1093,9 +952,12 @@ class App(tk.Tk):
             messagebox.showwarning("PX100", "Enter numeric current and cutoff voltage.")
             return False
 
-        # Reset capacity tester before test
+        # Reset before test
         self._log("PX100: Resetting before test…")
-        self.px100.reset()
+        try:
+            self.px100.reset()
+        except Exception:
+            pass
         time.sleep(0.2)
 
         # Start logging
@@ -1104,20 +966,23 @@ class App(tk.Tk):
         self._test_running = True
         self._test_cutoff_v = cutoff_v
 
+        # discharge timer
+        self._cell_discharge_start_ts = time.time()
+        self._cell_discharge_end_ts = None
+
         ok = self.px100.start_capacity_test(current_a=current_a, cutoff_v=cutoff_v)
         self._log("PX100 START TEST" if ok else "ERROR: PX100 start failed")
         if not ok:
             self._test_running = False
         return ok
 
-    def _px_extract_mah(self, row: dict):
+    def _px_extract_mah(self, row):
         cap_mah = safe_float(row.get("cap_mah"))
         if cap_mah is not None:
             return cap_mah
         cap_ah = safe_float(row.get("cap_ah"))
         if cap_ah is not None:
             return cap_ah * 1000.0
-        # fallbacks if driver uses different keys
         for k in ("capacity_mah", "mah"):
             v = safe_float(row.get(k))
             if v is not None:
@@ -1128,7 +993,7 @@ class App(tk.Tk):
                 return v * 1000.0
         return None
 
-    def _px_record_sample(self, row: dict):
+    def _px_record_sample(self, row):
         if not self._test_running or self._test_t0 is None:
             return
         v = safe_float(row.get("voltage"))
@@ -1142,18 +1007,16 @@ class App(tk.Tk):
         if self.px100 and self.px100.connected:
             row = self.px100.read_all()
 
-            # show on UI
             v = safe_float(row.get("voltage"))
             i = safe_float(row.get("current"))
             temp = safe_float(row.get("temp"))
             mah = self._px_extract_mah(row)
 
-            self.px_v_var.set("--.- V" if v is None else f"{v:.3f} V")
-            self.px_i_var.set("--.- A" if i is None else f"{i:.3f} A")
-            self.px_temp_var.set("-- °C" if temp is None else f"{temp:.1f} °C")
-            self.px_mah_var.set("---- mAh" if mah is None else f"{mah:.0f} mAh")
+            self.px_v_var.set("--.- V" if v is None else "%.3f V" % v)
+            self.px_i_var.set("--.- A" if i is None else "%.3f A" % i)
+            self.px_temp_var.set("-- °C" if temp is None else "%.1f °C" % temp)
+            self.px_mah_var.set("---- mAh" if mah is None else "%.0f mAh" % mah)
 
-            # time formatting (best-effort)
             tval = row.get("time")
             tstr = None
             if isinstance(tval, (int, float)):
@@ -1161,105 +1024,57 @@ class App(tk.Tk):
                 h = sec // 3600
                 m = (sec % 3600) // 60
                 s = sec % 60
-                tstr = f"{h:02d}:{m:02d}:{s:02d}"
+                tstr = "%02d:%02d:%02d" % (h, m, s)
             elif isinstance(tval, str):
                 tstr = tval
             elif tval is not None:
                 tstr = str(tval)
             self.px_time_var.set("--:--:--" if not tstr else tstr)
 
-            # record samples for graph
+            # record samples
             if self._test_running:
                 self._px_record_sample(row)
 
-                # stop condition by cutoff voltage (same logic as your script)
+                # stop condition by cutoff voltage
                 if self._test_cutoff_v is not None and v is not None and v <= float(self._test_cutoff_v):
-                    self._log(f"PX100: Cutoff reached (V={v:.3f} <= {self._test_cutoff_v:.3f}). Stopping test.")
+                    self._log("PX100: Cutoff reached (V=%.3f <= %.3f). Stopping test." % (v, float(self._test_cutoff_v)))
                     try:
                         self.px100.set_load_enabled(False)
                     except Exception:
                         pass
                     self._test_running = False
+
+                    # mark discharge end
+                    self._cell_discharge_end_ts = time.time()
+
                     self._on_capacity_test_finished()
 
         self.after(400, self._poll_px100)
 
-    # ---------------- Graph window + saving ----------------
-    def _px_show_graph(self):
-        if not self._test_samples:
-            messagebox.showinfo("PX100 Graph", "No samples yet.")
-            return
-
-        # Reuse existing window if open
-        if self._graph_win and self._graph_win.winfo_exists():
-            self._px_update_graph()
-            self._graph_win.lift()
-            return
-
-        win = tk.Toplevel(self)
-        win.title("PX100 Capacity Test Graph")
-        win.geometry("950x650")
-        self._graph_win = win
-
-        fig = Figure(dpi=100)
-        ax_v = fig.add_subplot(111)
-        ax_mah = ax_v.twinx()
-
-        self._graph_fig = fig
-        self._graph_ax_v = ax_v
-        self._graph_ax_mah = ax_mah
-
-        canvas = FigureCanvasTkAgg(fig, master=win)
-        canvas.draw()
-        canvas.get_tk_widget().pack(fill="both", expand=True)
-        self._graph_canvas = canvas
-
-        toolbar = NavigationToolbar2Tk(canvas, win)
-        toolbar.update()
-
-        btn_row = ttk.Frame(win, padding=6)
-        btn_row.pack(fill="x")
-        ttk.Button(btn_row, text="Refresh", command=self._px_update_graph).pack(side="left")
-        ttk.Button(btn_row, text="Save PNG (manual)", command=self._px_save_graph_png_dialog).pack(side="left", padx=(6, 0))
-        ttk.Button(btn_row, text="Close", command=win.destroy).pack(side="right")
-
-        self._px_update_graph()
-
-    def _px_update_graph(self):
-        if not (self._graph_win and self._graph_win.winfo_exists()):
-            return
-        if not self._test_samples:
-            return
-
-        ax_v = self._graph_ax_v
-        ax_mah = self._graph_ax_mah
-        fig = self._graph_fig
-
-        ax_v.cla()
-        ax_mah.cla()
-
-        x_v = [s["t"] for s in self._test_samples if s.get("v") is not None and s.get("t") is not None]
-        y_v = [s["v"] for s in self._test_samples if s.get("v") is not None and s.get("t") is not None]
-        if x_v:
-            ax_v.plot(x_v, y_v)
-        ax_v.set_xlabel("Time (s)")
-        ax_v.set_ylabel("Voltage (V)")
-
-        x_m = [s["t"] for s in self._test_samples if s.get("mah") is not None and s.get("t") is not None]
-        y_m = [s["mah"] for s in self._test_samples if s.get("mah") is not None and s.get("t") is not None]
-        if x_m:
-            ax_mah.plot(x_m, y_m)
-        ax_mah.set_ylabel("Capacity (mAh)")
-
-        fig.tight_layout()
-        self._graph_canvas.draw()
-
-    def _save_graph_png_auto(self, folder: str, capacity_mah):
+    # ---------------- Graph image prep for darker receipt printing ----------------
+    def _prepare_image_for_receipt(self, path):
         """
-        Save graph automatically with timestamp + capacity in filename.
+        Make the image print darker and crisper on receipt printers:
+        - grayscale
+        - boost contrast & sharpness
+        - threshold to 1-bit B/W (faster and darker)
+        """
+        from PIL import ImageEnhance
 
-        Generates an 800x600 PNG first (readable), then shrinks with PIL.thumbnail()
-        to receipt width (self.receipt_dots) so it prints nicely.
+        with Image.open(path) as im:
+            im = im.convert("L")
+            im = ImageEnhance.Contrast(im).enhance(float(self.receipt_img_contrast))
+            im = ImageEnhance.Sharpness(im).enhance(float(self.receipt_img_sharpness))
+
+            thr = int(self.receipt_img_threshold)
+            im = im.point(lambda p: 255 if p > thr else 0, mode="1")
+            im.save(path)
+
+    # ---------------- Graph save (voltage only) ----------------
+    def _save_graph_png_auto(self, folder, capacity_mah):
+        """
+        Save an 800x600 voltage-vs-time image, then thumbnail to receipt width,
+        then darken/threshold for printing. Voltage line is thicker for clarity.
         """
         os.makedirs(folder, exist_ok=True)
 
@@ -1267,125 +1082,200 @@ class App(tk.Tk):
         cap_str = "unknown"
         if capacity_mah is not None:
             try:
-                cap_str = f"{float(capacity_mah):.0f}mAh"
+                cap_str = "%.0fmAh" % float(capacity_mah)
             except Exception:
                 cap_str = "unknown"
 
-        filename = f"capacity_{cap_str}_{ts}.png"
+        filename = "capacity_%s_%s.png" % (cap_str, ts)
         path = os.path.join(folder, filename)
 
-        # ---- 1) Build a readable 800x600 figure ----
+        # Build 800x600
         width_px, height_px = 800, 600
-        dpi = 200  # 800x600 at 100 DPI
+        dpi = 100
         fig = Figure(dpi=dpi, figsize=(width_px / dpi, height_px / dpi))
-        ax_v = fig.add_subplot(111)
-        ax_mah = ax_v.twinx()
+        ax = fig.add_subplot(111)
 
-        # Pull series
         x_v = [s["t"] for s in self._test_samples if s.get("t") is not None and s.get("v") is not None]
         y_v = [s["v"] for s in self._test_samples if s.get("t") is not None and s.get("v") is not None]
-
-        x_m = [s["t"] for s in self._test_samples if s.get("t") is not None and s.get("mah") is not None]
-        y_m = [s["mah"] for s in self._test_samples if s.get("t") is not None and s.get("mah") is not None]
-
         if x_v:
-            ax_v.plot(x_v, y_v)
-        if x_m:
-            ax_mah.plot(x_m, y_m)
+            # thicker line for receipt clarity
+            ax.plot(x_v, y_v, linewidth=2.0)
 
-        # ---- 2) Remove labels/legend clutter (as requested) ----
-        # (No legend is created anyway unless you add labels to plot(); but remove axis labels and title)
-        ax_v.set_xlabel("")
-        ax_v.set_ylabel("")
-        ax_mah.set_ylabel("")
-        ax_v.set_title("")
-
-        # Optional: keep ticks but make them subtle
-        ax_v.tick_params(labelsize=8)
-        ax_mah.tick_params(labelsize=8)
-
-        # Optional: light grid helps a lot even without labels
-        ax_v.grid(True, linewidth=0.5)
+        # Clean receipt style: no labels/title, but keep ticks + grid
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        ax.set_title("")
+        ax.tick_params(labelsize=8)
+        ax.grid(True, linewidth=0.5)
 
         fig.tight_layout()
-
-        # Save initial PNG
         fig.savefig(path)
 
-        # ---- 3) Shrink with PIL.thumbnail() to receipt width ----
+        # Shrink to receipt width (keep aspect)
         try:
             with Image.open(path) as im:
-                # Ensure RGB (some backends save RGBA)
                 if im.mode not in ("RGB", "L"):
                     im = im.convert("RGB")
-
-                # shrink to receipt width, keeping aspect
                 target_w = int(getattr(self, "receipt_dots", 384))
-                im.thumbnail((target_w, 10_000), Image.LANCZOS)
-
-                # Optional: convert to 1-bit for crisper receipt printing
-                # If your printer struggles with greyscale, uncomment these 2 lines:
-                # im = im.convert("L")
-                # im = im.point(lambda p: 255 if p > 180 else 0, mode="1")
-
+                im.thumbnail((target_w, 10000), Image.LANCZOS)
                 im.save(path)
         except Exception as e:
-            # If thumbnail fails, we still keep the original 800x600 image saved
-            self._log(f"WARNING: could not thumbnail graph for receipt: {e}")
+            self._log("WARNING: could not thumbnail graph for receipt: %s" % e)
+            return path
+
+        # Darken/threshold for printer
+        try:
+            self._prepare_image_for_receipt(path)
+        except Exception as e:
+            self._log("WARNING: could not prepare image for receipt: %s" % e)
 
         return path
 
-
-    def _px_save_graph_png_dialog(self):
-        # Keep a manual option if you want it
+    # ---------------- Receipt printing ----------------
+    def _print_receipt_with_graph(self, graph_png_path, capacity_mah, charge_s, discharge_s, test_current_a, cutoff_v):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
-            from tkinter import filedialog
-        except Exception:
-            messagebox.showerror("Save graph", "filedialog not available")
-            return
+            p = Network(self.receipt_printer_ip, port=self.receipt_printer_port, timeout=10)
 
-        if not self._test_samples:
-            messagebox.showwarning("Save graph", "No samples to save.")
-            return
+            p.set(align="center", bold=True, width=2, height=2)
+            p.text("CELL TEST\n")
 
-        path = filedialog.asksaveasfilename(
-            title="Save graph as PNG",
-            defaultextension=".png",
-            filetypes=[("PNG image", "*.png")],
-            initialfile="capacity_test.png",
-        )
-        if not path:
-            return
+            p.set(align="center", bold=False, width=1, height=1)
+            p.text(ts + "\n\n")
 
-        # Save via the auto saver but to chosen path
-        try:
-            folder = os.path.dirname(path) or "."
-            base = os.path.basename(path)
-            os.makedirs(folder, exist_ok=True)
+            if capacity_mah is None:
+                p.text("CAP: ---- mAh\n")
+            else:
+                p.set(bold=True)
+                p.text("CAP: %.0f mAh\n" % float(capacity_mah))
+                p.set(bold=False)
 
-            # Build and save a fresh figure
-            fig = Figure(dpi=200)
-            ax_v = fig.add_subplot(111)
-            ax_mah = ax_v.twinx()
+            # Cleaner look (two compact lines)
+            if test_current_a is None:
+                test_current_a = safe_float(self.px_set_current.get())
+            if cutoff_v is None:
+                cutoff_v = safe_float(self.px_set_cutoff.get())
 
-            x_v = [s["t"] for s in self._test_samples if s.get("v") is not None and s.get("t") is not None]
-            y_v = [s["v"] for s in self._test_samples if s.get("v") is not None and s.get("t") is not None]
-            if x_v:
-                ax_v.plot(x_v, y_v)
-            ax_v.set_xlabel("Time (s)")
-            ax_v.set_ylabel("Voltage (V)")
+            if test_current_a is None:
+                p.text("I: --.-A  Vcut: --.--V\n")
+            else:
+                p.text("I: %.2fA  Vcut: %.2fV\n" % (float(test_current_a), float(cutoff_v) if cutoff_v is not None else 0.0))
 
-            x_m = [s["t"] for s in self._test_samples if s.get("mah") is not None and s.get("t") is not None]
-            y_m = [s["mah"] for s in self._test_samples if s.get("mah") is not None and s.get("t") is not None]
-            if x_m:
-                ax_mah.plot(x_m, y_m)
-            ax_mah.set_ylabel("Capacity (mAh)")
+            p.text("Tchg:%s  Tdis:%s\n" % (self._fmt_duration(charge_s), self._fmt_duration(discharge_s)))
+            p.text("\n")
 
-            fig.tight_layout()
-            fig.savefig(path)
-            self._log(f"Saved graph: {path}")
+            p.set(align="center")
+            p.image(graph_png_path)
+
+            p.text("\n")
+            p.cut()
         except Exception as e:
-            messagebox.showerror("Save graph", f"Failed to save:\n{e}")
+            self._log("CYCLE: ERROR printing receipt: %s" % e)
+
+    # ---------------- Printer test (dummy finished receipt) ----------------
+    def _make_dummy_graph_png(self, out_path):
+        """
+        Creates a dummy "finished" voltage curve graph matching the real style.
+        Returns dummy capacity (mAh).
+        """
+        total_s = 45 * 60
+        step_s = 5
+        n = total_s // step_s + 1
+
+        cutoff_v = safe_float(self.px_set_cutoff.get()) or 3.00
+        start_v = 4.15
+        end_v = cutoff_v
+
+        xs, vs = [], []
+        cap_final_mah = 3100.0
+
+        for i in range(int(n)):
+            t = i * step_s
+            frac = t / float(total_s)
+
+            # plausible discharge curve: sag -> plateau -> knee
+            if frac < 0.08:
+                v = start_v - 0.25 * (frac / 0.08)
+            elif frac < 0.85:
+                v = (start_v - 0.25) - 0.35 * ((frac - 0.08) / 0.77)
+            else:
+                v = (start_v - 0.25 - 0.35) - 0.55 * ((frac - 0.85) / 0.15)
+
+            v = max(end_v, min(start_v, v))
+            xs.append(t)
+            vs.append(v)
+
+        # 800x600 render
+        width_px, height_px = 800, 600
+        dpi = 100
+        fig = Figure(dpi=dpi, figsize=(width_px / dpi, height_px / dpi))
+        ax = fig.add_subplot(111)
+        ax.plot(xs, vs, linewidth=2.0)  # thicker line like real
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        ax.set_title("")
+        ax.tick_params(labelsize=8)
+        ax.grid(True, linewidth=0.5)
+        fig.tight_layout()
+        fig.savefig(out_path)
+
+        # thumbnail to receipt width
+        with Image.open(out_path) as im:
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            target_w = int(getattr(self, "receipt_dots", 384))
+            im.thumbnail((target_w, 10000), Image.LANCZOS)
+            im.save(out_path)
+
+        # darken for printer
+        self._prepare_image_for_receipt(out_path)
+
+        return cap_final_mah
+
+    def _printer_test(self):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        folder = os.path.join(os.getcwd(), "capacity_graphs")
+        os.makedirs(folder, exist_ok=True)
+        tmp_path = os.path.join(folder, "printer_test_dummy_graph.png")
+
+        try:
+            cap_final_mah = self._make_dummy_graph_png(tmp_path)
+        except Exception as e:
+            messagebox.showerror("Printer test", "Failed to generate dummy graph:\n%s" % e)
+            self._log("ERROR: dummy graph generation failed: %s" % e)
+            return
+
+        try:
+            current_a = safe_float(self.px_set_current.get()) or 1.00
+            cutoff_v = safe_float(self.px_set_cutoff.get()) or 3.00
+
+            p = Network(self.receipt_printer_ip, port=self.receipt_printer_port, timeout=10)
+
+            p.set(align="center", bold=True, width=2, height=2)
+            p.text("TEST RECEIPT\n")
+
+            p.set(align="center", bold=False, width=1, height=1)
+            p.text(ts + "\n\n")
+
+            p.set(bold=True)
+            p.text("CAP: %.0f mAh\n" % cap_final_mah)
+            p.set(bold=False)
+
+            p.text("I: %.2fA  Vcut: %.2fV\n" % (current_a, cutoff_v))
+            p.text("Tchg:%s  Tdis:%s\n" % ("12:34", "45:00"))
+            p.text("\n")
+
+            p.set(align="center")
+            p.image(tmp_path)
+
+            p.text("\n")
+            p.cut()
+
+            self._log("Printer test sent (dummy graph) -> %s:%d" % (self.receipt_printer_ip, self.receipt_printer_port))
+        except Exception as e:
+            messagebox.showerror("Printer test", "Failed to print:\n%s" % e)
+            self._log("ERROR: printer test failed: %s" % e)
 
     # ---------------- Automation cycle ----------------
     def _stop_cycle(self):
@@ -1393,7 +1283,9 @@ class App(tk.Tk):
         self._proc_state = "IDLE"
         self._charge_low_since = None
         self._test_running = False
+        self._psu_on_cmd_ts = None
         self._log("CYCLE: cancelled")
+
         # safety: turn off PSU + PX100 load
         try:
             if self.dps and self.dps.connected:
@@ -1407,14 +1299,6 @@ class App(tk.Tk):
             pass
 
     def _start_cycle_next_cell(self):
-        """
-        User flow:
-          - Put tray in, click LOAD (HOME+RECONNECT)
-          - Tick Charge and/or Test, optionally Auto-run
-          - Click NEXT CELL (run cycle) -> does:
-            NEXT -> RECONNECT -> CHARGE (optional) -> PSU OFF -> PX100 reset+test (optional) -> graph+save
-            If Auto-run checked: repeats NEXT until tray empty / failure / cancelled.
-        """
         if self._proc_state != "IDLE":
             self._log("CYCLE: already running")
             return
@@ -1431,6 +1315,12 @@ class App(tk.Tk):
             self._log("ERROR: Test enabled but PX100 not connected")
             return
 
+        # reset per-cell timings
+        self._cell_charge_start_ts = None
+        self._cell_charge_end_ts = None
+        self._cell_discharge_start_ts = None
+        self._cell_discharge_end_ts = None
+
         self._proc_cancel = False
         self._tray_empty_hint = False
         self._proc_state = "MOVE_NEXT"
@@ -1444,14 +1334,12 @@ class App(tk.Tk):
             self._proc_state = "IDLE"
             return
 
-        # stop if tray hints empty
         if self._tray_empty_hint:
             self._log("CYCLE: tray reported empty / no more cells. Stopping.")
             self._proc_state = "IDLE"
             return
 
         if self._proc_state == "MOVE_NEXT":
-            # wait for a cell to be "loaded"
             self._proc_state = "WAIT_CELL"
             self._wait_cell_start = time.time()
             self.after(200, self._cycle_tick)
@@ -1460,7 +1348,6 @@ class App(tk.Tk):
         if self._proc_state == "WAIT_CELL":
             if self._tray_cell_looks_loaded():
                 self._log("CYCLE: cell loaded.")
-                # decide next phase
                 if self.auto_charge.get():
                     self._proc_state = "CHARGE_START"
                 elif self.auto_test.get():
@@ -1470,7 +1357,6 @@ class App(tk.Tk):
                 self.after(100, self._cycle_tick)
                 return
 
-            # timeout -> likely empty tray or jam
             if (time.time() - self._wait_cell_start) > 6.0:
                 self._log("CYCLE: could not confirm a cell (empty tray or jam). Stopping.")
                 self._proc_state = "IDLE"
@@ -1483,6 +1369,9 @@ class App(tk.Tk):
             self._log("CYCLE: charging (PSU ON)…")
             self._charge_low_since = None
             self._psu_on_cmd_ts = time.time()
+
+            self._cell_charge_start_ts = time.time()
+            self._cell_charge_end_ts = None
 
             ok = self.dps.set_output_enabled(True)
             if not ok:
@@ -1499,25 +1388,20 @@ class App(tk.Tk):
             out_en = self._psu_last_out_en
             now = time.time()
 
-            # --- Grace period: allow the PSU a few seconds to actually report ON ---
-            if self._psu_on_cmd_ts is not None:
-                if (now - self._psu_on_cmd_ts) < self.psu_on_grace_s:
-                    # During grace period we don't treat OFF as an error
-                    self.after(400, self._cycle_tick)
-                    return
+            # grace period: allow time for PSU to report ON
+            if self._psu_on_cmd_ts is not None and (now - self._psu_on_cmd_ts) < self.psu_on_grace_s:
+                self.after(400, self._cycle_tick)
+                return
 
-            # After grace: if PSU still says OFF, then it's a real problem
             if out_en == 0:
                 self._log("CYCLE: PSU output is OFF unexpectedly (after grace). Stopping.")
                 self._proc_state = "IDLE"
                 return
 
-            # If we can't read current yet, just keep waiting
             if cur is None:
                 self.after(400, self._cycle_tick)
                 return
 
-            # Charge complete when current <= 0.10A for 10 seconds
             if cur <= self.charge_cutoff_a:
                 if self._charge_low_since is None:
                     self._charge_low_since = now
@@ -1526,6 +1410,9 @@ class App(tk.Tk):
                 if low_for >= self.charge_stabilize_s:
                     self._log("CYCLE: charge complete (cutoff stable). PSU OFF.")
                     self.dps.set_output_enabled(False)
+
+                    self._cell_charge_end_ts = time.time()
+
                     self._charge_low_since = None
                     self._psu_on_cmd_ts = None
 
@@ -1538,9 +1425,8 @@ class App(tk.Tk):
             self.after(400, self._cycle_tick)
             return
 
-
         if self._proc_state == "TEST_START":
-            # ensure PSU off
+            # ensure PSU off regardless of whether we charged
             try:
                 if self.dps and self.dps.connected:
                     self.dps.set_output_enabled(False)
@@ -1558,12 +1444,9 @@ class App(tk.Tk):
             return
 
         if self._proc_state == "TEST_WAIT":
-            # Test completion is detected in _poll_px100 via cutoff and calls _on_capacity_test_finished()
-            # So here we just keep waiting.
             if self._test_running:
                 self.after(500, self._cycle_tick)
                 return
-            # If _test_running is false but we didn't transition yet, we'll finish here.
             self._proc_state = "FINISH"
             self.after(100, self._cycle_tick)
             return
@@ -1571,11 +1454,17 @@ class App(tk.Tk):
         if self._proc_state == "FINISH":
             self._log("CYCLE: finished cell.")
 
-            # Auto-run next cell?
             if self.auto_run.get():
                 self._log("CYCLE: auto-run -> next cell…")
                 self._proc_state = "MOVE_NEXT"
                 self._tray_empty_hint = False
+
+                # reset per-cell timings
+                self._cell_charge_start_ts = None
+                self._cell_charge_end_ts = None
+                self._cell_discharge_start_ts = None
+                self._cell_discharge_end_ts = None
+
                 self._tray_send("NEXT")
                 self.after(250, lambda: self._tray_send("RECONNECT"))
                 self.after(300, self._cycle_tick)
@@ -1585,16 +1474,23 @@ class App(tk.Tk):
             return
 
     def _on_capacity_test_finished(self):
-        """
-        Called when the PX100 test hits cutoff and stops.
-        Saves graph automatically with timestamp+capacity and prints a receipt containing the graph.
-        """
-        # compute final capacity
+        # final capacity from last sample with mah
         cap = None
         for s in reversed(self._test_samples):
             cap = safe_float(s.get("mah"))
             if cap is not None:
                 break
+
+        charge_s = None
+        if self._cell_charge_start_ts is not None and self._cell_charge_end_ts is not None:
+            charge_s = self._cell_charge_end_ts - self._cell_charge_start_ts
+
+        discharge_s = None
+        if self._cell_discharge_start_ts is not None and self._cell_discharge_end_ts is not None:
+            discharge_s = self._cell_discharge_end_ts - self._cell_discharge_start_ts
+
+        test_current_a = safe_float(self.px_set_current.get())
+        cutoff_v = safe_float(self.px_set_cutoff.get())
 
         folder = os.path.join(os.getcwd(), "capacity_graphs")
         path = None
@@ -1602,16 +1498,15 @@ class App(tk.Tk):
             path = self._save_graph_png_auto(folder=folder, capacity_mah=cap)
             self._last_saved_path = path
             if path:
-                self._log(f"CYCLE: saved graph -> {path}")
+                self._log("CYCLE: saved graph -> %s" % path)
         except Exception as e:
-            self._log(f"CYCLE: ERROR saving graph: {e}")
+            self._log("CYCLE: ERROR saving graph: %s" % e)
 
-        # Print receipt (instead of showing graph window)
         if path:
             self._log("CYCLE: printing receipt…")
-            self._print_receipt_with_graph(path, cap)
+            self._print_receipt_with_graph(path, cap, charge_s, discharge_s, test_current_a, cutoff_v)
 
-        # proceed in the automation state machine
+        # advance state machine if waiting
         if self._proc_state == "TEST_WAIT":
             self._proc_state = "FINISH"
             self.after(100, self._cycle_tick)
