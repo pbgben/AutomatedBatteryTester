@@ -138,6 +138,12 @@ class App(tk.Tk):
         tray = self.tray_port.get().strip()
         psu = self.psu_port.get().strip()
         px = self.px_port.get().strip()
+
+        if not tray and not psu and not px:
+            messagebox.showwarning("Ports", "No ports set. Click Auto-detect first.")
+            return
+
+        self._log_local("Connect All clicked: tray=%r psu=%r px=%r" % (tray, psu, px))
         self.runner.connect_all(tray, psu, px)
 
     def _disconnect_all(self):
@@ -175,6 +181,11 @@ class App(tk.Tk):
             test_current_a=test_i,
             cutoff_v=cutoff,
         )
+    def _log_local(self, msg):
+        self.log.configure(state="normal")
+        self.log.insert("end", msg + "\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
 
     # ---------- Pump updates ----------
     def _ui_pump(self):

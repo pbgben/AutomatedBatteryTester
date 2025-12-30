@@ -261,6 +261,7 @@ class AutomationRunner:
             except Exception as e:
                 self._log("PX100 connect error: %s" % e)
                 self.px = None
+        self._poll_devices()
 
     def _do_disconnect_all(self):
         self._auto_running = False
@@ -530,6 +531,7 @@ class AutomationRunner:
             # commands
             try:
                 cmd, payload = self._cmdq.get_nowait()
+                self._log("CMD: %s %s" % (cmd, payload))
             except queue.Empty:
                 time.sleep(0.02)
                 continue
