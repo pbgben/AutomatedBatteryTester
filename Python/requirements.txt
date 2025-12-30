@@ -1,0 +1,5 @@
+pyserial
+pymodbus
+matplotlib
+pillow
+python-escpos
