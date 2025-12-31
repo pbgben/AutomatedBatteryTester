@@ -125,13 +125,40 @@ class App(tk.Tk):
         # ---- Log tab ----
         logf = ttk.LabelFrame(tab_log, text="Log", padding=6)
         logf.pack(fill="both", expand=True)
-
-        self.log = tk.Text(logf, wrap="word", font=("Sans", 10))
+        self.log = tk.Text(
+            logf,
+            wrap="word",
+            font=("Sans", 10),
+            state="disabled",
+            takefocus=True,
+            cursor="arrow",
+        )
         yscroll = ttk.Scrollbar(logf, orient="vertical", command=self.log.yview)
         self.log.configure(yscrollcommand=yscroll.set)
         self.log.pack(side="left", fill="both", expand=True)
         yscroll.pack(side="right", fill="y")
         self.log.configure(state="disabled")
+        # Enable Ctrl+C copy even when disabled
+        def _copy_log(event):
+            try:
+                self.log.event_generate("<<Copy>>")
+            except Exception:
+                pass
+            return "break"
+
+        self.log.bind("<Control-c>", _copy_log)
+        self.log.bind("<Control-C>", _copy_log)
+        # Right-click context menu
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Copy", command=lambda: self.log.event_generate("<<Copy>>"))
+
+        def _show_log_menu(event):
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        self.log.bind("<Button-3>", _show_log_menu)  # Right click
 
     # ---------- UI actions ----------
     def _connect_all(self):

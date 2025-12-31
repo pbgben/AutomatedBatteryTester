@@ -2,6 +2,8 @@ import os
 import threading
 import time
 import queue
+import traceback
+import threading
 
 from util.log import LogBus
 
@@ -84,6 +86,30 @@ class AutomationRunner:
         self._tray_empty_hint = False
 
         self._thread.start()
+
+    def _run_with_timeout(self, fn, timeout_s, name):
+        done = {"ok": False, "err": None}
+
+        def _t():
+            try:
+                fn()
+                done["ok"] = True
+            except Exception as e:
+                done["err"] = e
+
+        t = threading.Thread(target=_t, daemon=True)
+        t.start()
+        t.join(timeout_s)
+
+        if t.is_alive():
+            self._log("ERROR: %s connect timed out after %.1fs" % (name, float(timeout_s)))
+            return False
+
+        if done["err"] is not None:
+            self._log("ERROR: %s connect failed: %s" % (name, done["err"]))
+            return False
+
+        return True
 
     # ---------- UI commands ----------
     def connect_all(self, tray_port, psu_port, px_port):
@@ -228,40 +254,50 @@ class AutomationRunner:
 
     # ---------- command handling ----------
     def _do_connect_all(self, tray_port, psu_port, px_port):
-        # tray
-        if tray_port:
-            try:
-                self.tray.connect(tray_port, 9600)
-                self._log("Tray connected: %s" % tray_port)
-            except Exception as e:
-                self._log("Tray connect failed: %s" % e)
+        self._log("Connecting: tray=%r psu=%r px=%r" % (tray_port, psu_port, px_port))
 
-        # psu
+        # ---- Tray ----
+        if tray_port:
+            def _do_tray():
+                self.tray.connect(tray_port, 9600)
+
+            ok = self._run_with_timeout(_do_tray, timeout_s=3.0, name="Tray")
+            if ok:
+                self._log("Tray connected: %s" % tray_port)
+            else:
+                self._log("Tray not connected")
+
+        # ---- PSU ----
         if psu_port:
-            try:
+            def _do_psu():
                 self.psu = self.psu_factory(psu_port)
-                if self.psu.connect():
-                    self._log("PSU connected: %s" % psu_port)
-                else:
-                    self._log("PSU connect failed")
-                    self.psu = None
-            except Exception as e:
-                self._log("PSU connect error: %s" % e)
+                if not self.psu.connect():
+                    raise RuntimeError("Modbus connect() returned False")
+
+            ok = self._run_with_timeout(_do_psu, timeout_s=3.0, name="PSU")
+            if ok:
+                self._log("PSU connected: %s" % psu_port)
+            else:
+                self._log("PSU not connected")
                 self.psu = None
 
-        # px
+        # ---- PX100 ----
         if px_port:
-            try:
+            def _do_px():
                 self.px = self.px_factory(px_port)
-                if self.px.connect():
-                    self._log("PX100 connected: %s" % px_port)
-                else:
-                    self._log("PX100 connect failed")
-                    self.px = None
-            except Exception as e:
-                self._log("PX100 connect error: %s" % e)
+                if not self.px.connect():
+                    raise RuntimeError("PX connect() returned False")
+
+            ok = self._run_with_timeout(_do_px, timeout_s=3.0, name="PX100")
+            if ok:
+                self._log("PX100 connected: %s" % px_port)
+            else:
+                self._log("PX100 not connected")
                 self.px = None
+
+        # Force immediate status update
         self._poll_devices()
+        self._log("CONNECT_ALL finished")
 
     def _do_disconnect_all(self):
         self._auto_running = False
@@ -536,22 +572,37 @@ class AutomationRunner:
                 time.sleep(0.02)
                 continue
 
-            if cmd == "CONNECT_ALL":
-                self._do_connect_all(payload.get("tray"), payload.get("psu"), payload.get("px"))
-            elif cmd == "DISCONNECT_ALL":
-                self._do_disconnect_all()
-            elif cmd == "LOAD_TRAY":
-                self._do_load_tray()
-            elif cmd == "PRINTER_TEST":
-                self._do_printer_test()
-            elif cmd == "START_AUTO":
-                # run blocking in this background thread
-                self._do_start_auto(
-                    payload.get("charge", True),
-                    payload.get("test", True),
-                    payload.get("test_current_a", 1.0),
-                    payload.get("cutoff_v", 3.0),
-                )
-            elif cmd == "STOP":
-                self._auto_running = False
-                self._force_outputs_off()
+            try:
+                if cmd == "CONNECT_ALL":
+                    self._do_connect_all(payload.get("tray"), payload.get("psu"), payload.get("px"))
+                    self._poll_devices()
+                    self._log("CONNECT_ALL done: tray=%s psu=%s px=%s" % (
+                        self.tray.is_connected(),
+                        bool(self.psu and self.psu.connected),
+                        bool(self.px and self.px.connected),
+                    ))
+
+                elif cmd == "DISCONNECT_ALL":
+                    self._do_disconnect_all()
+
+                elif cmd == "LOAD_TRAY":
+                    self._do_load_tray()
+
+                elif cmd == "PRINTER_TEST":
+                    self._do_printer_test()
+
+                elif cmd == "START_AUTO":
+                    self._do_start_auto(
+                        payload.get("charge", True),
+                        payload.get("test", True),
+                        payload.get("test_current_a", 1.0),
+                        payload.get("cutoff_v", 3.0),
+                    )
+
+                elif cmd == "STOP":
+                    self._auto_running = False
+                    self._force_outputs_off()
+
+            except Exception as e:
+                self._log("ERROR handling cmd %s: %s" % (cmd, e))
+                self._log(traceback.format_exc())
